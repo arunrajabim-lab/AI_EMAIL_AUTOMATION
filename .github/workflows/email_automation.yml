@@ -2,44 +2,32 @@ name: AI Email Automation
 
 on:
   schedule:
-    # Run every 15 minutes
     - cron: "*/15 * * * *"
 
-  # Allows manual testing from GitHub Actions
   workflow_dispatch:
 
 jobs:
+
   run-email-automation:
+
     runs-on: ubuntu-latest
 
     steps:
 
-      # --------------------------------------------------
-      # 1. Download repository
-      # --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
-      # 2. Setup Python
-      # --------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # --------------------------------------------------
-      # 3. Install Python packages
-      # --------------------------------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --------------------------------------------------
-      # 4. Run Email Automation
-      # --------------------------------------------------
-      - name: Run Automation
+      - name: Run AI Email Automation
         env:
           GMAIL_CREDENTIALS: ${{ secrets.GMAIL_CREDENTIALS }}
           GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN }}
