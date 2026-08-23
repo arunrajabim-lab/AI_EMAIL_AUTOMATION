@@ -49,11 +49,9 @@ SCHEDULE_FILE = os.path.join(
     "scheduled_records.json"
 )
 
-# Normal mode: send at each recipient's local 10:20 AM.
-# For a manual test, set TEST_SEND_NOW=true in the GitHub Actions run.
-TEST_SEND_NOW = os.environ.get("TEST_SEND_NOW", "false").strip().lower() in {
-    "1", "true", "yes", "y", "on"
-}
+# Confirmed production schedule: send at 5:00 PM in each recipient's local timezone.
+SEND_HOUR = 17
+SEND_MINUTE = 0
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -779,12 +777,12 @@ def calculate_schedule(
 
     now_local = datetime.now(local_zone)
 
-    # Send at 10:20 AM in the recipient's local timezone.
-    # If today's 10:20 AM has not passed yet, schedule today.
+    # Send at 5:00 PM in the recipient's local timezone.
+    # If today's 5:00 PM has not passed yet, schedule today.
     # Otherwise schedule the next day.
     target_local = now_local.replace(
-        hour=10,
-        minute=20,
+        hour=SEND_HOUR,
+        minute=SEND_MINUTE,
         second=0,
         microsecond=0
     )
@@ -1116,32 +1114,19 @@ def get_daily_key(email, local_date):
 def schedule_mail(mail, scheduled_records, sent_records):
     email = mail["to"]
 
-    if TEST_SEND_NOW:
-        tz_name = timezone_for_city(mail["location"])
-        if not tz_name:
-            log(f"TIMEZONE ERROR | {email} | {mail['location']}")
-            return
-        try:
-            now_local = datetime.now(ZoneInfo(tz_name))
-        except Exception as e:
-            log(f"TIMEZONE ERROR | {email} | {e}")
-            return
-        target_utc = datetime.now(timezone.utc) - timedelta(seconds=1)
-        target_date = now_local.date()
-    else:
-        target_utc, tz_name = calculate_schedule(mail["location"])
+    target_utc, tz_name = calculate_schedule(mail["location"])
+
     if not target_utc:
         log(f"TIMEZONE ERROR | {email} | {mail['location']}")
         return
-    if not TEST_SEND_NOW:
-        try:
-            target_date = target_utc.astimezone(ZoneInfo(tz_name)).date()
-        except Exception as e:
-            log(f"DATE ERROR | {email} | {e}")
-            return
+
+    try:
+        target_date = target_utc.astimezone(ZoneInfo(tz_name)).date()
+    except Exception as e:
+        log(f"DATE ERROR | {email} | {e}")
+        return
+
     # One recipient address can receive only ONE successful email PER LOCAL DAY.
-    # The daily key is email + recipient local date, so the same address can
-    # receive a new campaign mail again on a later day.
     daily_key = get_daily_key(email, target_date)
     if daily_key in sent_records:
         log(f"DAILY LIMIT | {email} | Already successfully sent for {target_date}")
@@ -1149,16 +1134,27 @@ def schedule_mail(mail, scheduled_records, sent_records):
 
     if daily_key in scheduled_records:
         return
+
     try:
         subject, body = load_template(mail["type"])
         attachments = get_attachments(mail["type"])
     except Exception as e:
         log(f"TEMPLATE ERROR | {email} | {e}")
         return
-    scheduled_records[daily_key] = {"key":daily_key,"email":email,"location":mail["location"],"timezone":tz_name,"local_date":target_date.isoformat(),"type":mail["type"],"subject":subject,"send_utc":target_utc.isoformat(),"created_at":datetime.now(timezone.utc).isoformat()}
-    save_json(SCHEDULE_FILE, scheduled_records)
-    log(f"SCHEDULED | {email} | {mail['location']} | {tz_name} | {target_date} | 10:20 AM LOCAL | PDFs: {len(attachments)}")
 
+    scheduled_records[daily_key] = {
+        "key": daily_key,
+        "email": email,
+        "location": mail["location"],
+        "timezone": tz_name,
+        "local_date": target_date.isoformat(),
+        "type": mail["type"],
+        "subject": subject,
+        "send_utc": target_utc.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    save_json(SCHEDULE_FILE, scheduled_records)
+    log(f"SCHEDULED | {email} | {mail['location']} | {tz_name} | {target_date} | 5:00 PM LOCAL | PDFs: {len(attachments)}")
 
 
 # ============================================================
@@ -1272,7 +1268,7 @@ def send_due_emails(scheduled_records, sent_records, gmail_service):
             save_json(SCHEDULE_FILE, scheduled_records)
             continue
 
-        if not TEST_SEND_NOW and now_utc < send_time:
+        if now_utc < send_time:
             continue
 
         try:
@@ -1353,8 +1349,6 @@ def main():
     log("AI EMAIL AUTOMATION STARTED")
     log("Google Drive + Gemini + Gmail")
     log("=" * 60)
-    if TEST_SEND_NOW:
-        log("TEST SEND NOW | 10:20 AM LOCAL SCHEDULE BYPASSED FOR THIS RUN")
 
     credentials = get_credentials()
 
