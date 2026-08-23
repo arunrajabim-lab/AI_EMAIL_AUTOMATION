@@ -589,6 +589,18 @@ def sync_from_drive(
 
 
 # ============================================================
+# DRIVE DELETE HELPER
+# ============================================================
+
+def delete_drive_file_if_exists(service, folder_id, filename):
+    """Delete a specific file from a Drive folder if it exists."""
+    existing = find_drive_file(service, folder_id, filename)
+    if existing:
+        service.files().delete(fileId=existing["id"]).execute()
+        log(f"DRIVE DELETE | {filename}")
+
+
+# ============================================================
 # SYNC LOCAL DATA BACK TO DRIVE
 # ============================================================
 
@@ -597,7 +609,6 @@ def sync_data_to_drive(
 ):
 
     try:
-
         data_folder = ensure_drive_folder(
             drive_service,
             DRIVE_ROOT_FOLDER_ID,
@@ -622,15 +633,28 @@ def sync_data_to_drive(
             logs_folder
         )
 
-        log(
-            "DRIVE DATA SYNC COMPLETE"
+        # MAILS is stateful. Upload the current local state back to Drive.
+        # daily_mails.txt is intentionally preserved even when it becomes
+        # empty; only successfully sent recipient blocks are removed.
+        mails_folder = ensure_drive_folder(
+            drive_service,
+            DRIVE_ROOT_FOLDER_ID,
+            "MAILS"
         )
 
-    except Exception as e:
+        upload_folder_to_drive(
+            drive_service,
+            MAILS_DIR,
+            mails_folder
+        )
 
+        log("DRIVE DATA + MAIL STATE SYNC COMPLETE")
+
+    except Exception as e:
         log(
             f"DRIVE DATA SYNC ERROR | {e}"
         )
+
 
 
 # ============================================================
@@ -745,33 +769,24 @@ def calculate_schedule(
         return None, None
 
     try:
-
-        local_zone = ZoneInfo(
-            tz_name
-        )
-
+        local_zone = ZoneInfo(tz_name)
     except Exception:
-
         return None, None
 
-    now_local = datetime.now(
-        local_zone
+    now_local = datetime.now(local_zone)
+
+    # Send at 10:20 AM in the recipient's local timezone.
+    # If today's 10:20 AM has not passed yet, schedule today.
+    # Otherwise schedule the next day.
+    target_local = now_local.replace(
+        hour=10,
+        minute=20,
+        second=0,
+        microsecond=0
     )
 
-    next_day = (
-        now_local.date()
-        + timedelta(days=1)
-    )
-
-    target_local = datetime(
-        next_day.year,
-        next_day.month,
-        next_day.day,
-        10,
-        20,
-        0,
-        tzinfo=local_zone
-    )
+    if now_local >= target_local:
+        target_local = target_local + timedelta(days=1)
 
     target_utc = target_local.astimezone(
         timezone.utc
@@ -1084,243 +1099,221 @@ def create_message(
 
 
 # ============================================================
+# DAILY EMAIL KEY
+# ============================================================
+
+def get_daily_key(email, local_date):
+    return f"{email.lower()}|{local_date.isoformat()}"
+
+# ============================================================
 # SCHEDULE
 # ============================================================
 
-def schedule_mail(
-    mail,
-    scheduled_records,
-    sent_records
-):
-
+def schedule_mail(mail, scheduled_records, sent_records):
     email = mail["to"]
-
-    if email in sent_records:
-
-        log(
-            f"DUPLICATE BLOCKED | {email}"
-        )
-
-        return
-
-    if email in scheduled_records:
-        return
-
-    target_utc, tz_name = calculate_schedule(
-        mail["location"]
-    )
-
+    target_utc, tz_name = calculate_schedule(mail["location"])
     if not target_utc:
+        log(f"TIMEZONE ERROR | {email} | {mail['location']}")
+        return
+    try:
+        target_date = target_utc.astimezone(ZoneInfo(tz_name)).date()
+    except Exception as e:
+        log(f"DATE ERROR | {email} | {e}")
+        return
+    # One recipient address can receive only ONE successful email PER LOCAL DAY.
+    # The daily key is email + recipient local date, so the same address can
+    # receive a new campaign mail again on a later day.
+    daily_key = get_daily_key(email, target_date)
+    if daily_key in sent_records:
+        log(f"DAILY LIMIT | {email} | Already successfully sent for {target_date}")
+        return
 
-        log(
-            f"TIMEZONE ERROR | "
-            f"{email} | "
-            f"{mail['location']}"
-        )
+    if daily_key in scheduled_records:
+        return
+    try:
+        subject, body = load_template(mail["type"])
+        attachments = get_attachments(mail["type"])
+    except Exception as e:
+        log(f"TEMPLATE ERROR | {email} | {e}")
+        return
+    scheduled_records[daily_key] = {"key":daily_key,"email":email,"location":mail["location"],"timezone":tz_name,"local_date":target_date.isoformat(),"type":mail["type"],"subject":subject,"send_utc":target_utc.isoformat(),"created_at":datetime.now(timezone.utc).isoformat()}
+    save_json(SCHEDULE_FILE, scheduled_records)
+    log(f"SCHEDULED | {email} | {mail['location']} | {tz_name} | {target_date} | 10:20 AM LOCAL | PDFs: {len(attachments)}")
 
+
+
+# ============================================================
+# MOVE SUCCESSFULLY SENT MAIL TO COMPLETED
+# ============================================================
+
+def move_mail_to_completed(email, record):
+    """
+    Remove only the successfully sent recipient block(s) from pending
+    daily_mails.txt and move them to MAILS/completed.
+
+    IMPORTANT: daily_mails.txt itself is never deleted. It remains as the
+    master pending-mail file on Google Drive; only the sent recipient
+    block is removed.
+    """
+
+    if not os.path.exists(DAILY_MAILS_FILE):
         return
 
     try:
+        with open(DAILY_MAILS_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
 
-        subject, body = load_template(
-            mail["type"]
-        )
+        blocks = content.split("---MAIL---")
+        remaining = []
+        completed = []
+        target_email = email.strip().lower()
 
-        attachments = get_attachments(
-            mail["type"]
-        )
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+
+            block_email = ""
+            for line in block.splitlines():
+                if line.strip().upper().startswith("TO:"):
+                    block_email = line.strip()[3:].strip().lower()
+                    break
+
+            if block_email == target_email:
+                completed.append(block)
+            else:
+                remaining.append(block)
+
+        # IMPORTANT: Never delete daily_mails.txt itself.
+        # The file is the master pending-mail input on Google Drive.
+        # Only the successfully sent recipient block is removed from it.
+        pending_content = "\n\n---MAIL---\n\n".join(remaining)
+        if pending_content:
+            pending_content += "\n"
+
+        with open(DAILY_MAILS_FILE, "w", encoding="utf-8") as f:
+            f.write(pending_content)
+
+        if completed:
+            os.makedirs(COMPLETED_DIR, exist_ok=True)
+            date_text = record.get(
+                "local_date",
+                datetime.now().date().isoformat()
+            )
+            safe = (
+                target_email
+                .replace("@", "_at_")
+                .replace(".", "_")
+            )
+            filename = f"{date_text}_{safe}.txt"
+            completed_path = os.path.join(
+                COMPLETED_DIR,
+                filename
+            )
+
+            with open(completed_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "---MAIL---\n\n"
+                    + "\n\n---MAIL---\n\n".join(completed)
+                    + "\n"
+                )
+
+            log(f"MOVED TO COMPLETED | {email} | {filename}")
 
     except Exception as e:
-
-        log(
-            f"TEMPLATE ERROR | "
-            f"{email} | {e}"
-        )
-
-        return
-
-    scheduled_records[email] = {
-
-        "email": email,
-
-        "location": mail["location"],
-
-        "timezone": tz_name,
-
-        "type": mail["type"],
-
-        "subject": subject,
-
-        "send_utc": target_utc.isoformat(),
-
-        "created_at": datetime.now(
-            timezone.utc
-        ).isoformat()
-    }
-
-    save_json(
-        SCHEDULE_FILE,
-        scheduled_records
-    )
-
-    log(
-        f"SCHEDULED | "
-        f"{email} | "
-        f"{mail['location']} | "
-        f"{tz_name} | "
-        f"10:20 AM LOCAL | "
-        f"PDFs: {len(attachments)}"
-    )
+        log(f"COMPLETED MOVE ERROR | {email} | {e}")
 
 
 # ============================================================
 # SEND DUE EMAILS
 # ============================================================
 
-def send_due_emails(
-    scheduled_records,
-    sent_records,
-    gmail_service
-):
+def send_due_emails(scheduled_records, sent_records, gmail_service):
+    now_utc = datetime.now(timezone.utc)
 
-    now_utc = datetime.now(
-        timezone.utc
-    )
+    # The daily key (email + recipient local date) enforces one successful
+    # email per recipient per local day, while allowing the same recipient
+    # to receive a new campaign mail on the next day.
 
-    for email in list(
-        scheduled_records.keys()
-    ):
-
-        record = scheduled_records[email]
+    for daily_key in list(scheduled_records.keys()):
+        record = scheduled_records[daily_key]
+        email = record["email"].strip().lower()
 
         try:
-
-            send_time = datetime.fromisoformat(
-                record["send_utc"]
-            )
-
+            send_time = datetime.fromisoformat(record["send_utc"])
         except Exception as e:
+            log(f"INVALID SCHEDULE | {email} | {e}")
+            continue
 
+        if daily_key in sent_records:
             log(
-                f"INVALID SCHEDULE | "
-                f"{email} | {e}"
+                f"DAILY LIMIT | {email} | Already successfully sent for {record.get('local_date')}"
             )
-
+            del scheduled_records[daily_key]
+            save_json(SCHEDULE_FILE, scheduled_records)
             continue
 
         if now_utc < send_time:
             continue
 
-        if email in sent_records:
-
-            log(
-                f"DUPLICATE BLOCKED AT SEND | "
-                f"{email}"
-            )
-
-            del scheduled_records[email]
-
-            save_json(
-                SCHEDULE_FILE,
-                scheduled_records
-            )
-
-            continue
-
         try:
-
-            subject, body = load_template(
-                record["type"]
-            )
-
+            subject, body = load_template(record["type"])
             subject, body = personalize_with_gemini(
                 subject,
                 body,
                 record["location"],
                 record["type"]
             )
-
-            attachments = get_attachments(
-                record["type"]
-            )
-
-            gmail_message = create_message(
+            attachments = get_attachments(record["type"])
+            msg = create_message(
                 email,
                 subject,
                 body,
                 attachments
             )
 
-            result = (
-                gmail_service
-                .users()
-                .messages()
-                .send(
-                    userId="me",
-                    body=gmail_message
-                )
-                .execute()
-            )
+            result = gmail_service.users().messages().send(
+                userId="me",
+                body=msg
+            ).execute()
+            mid = result.get("id", "")
 
-            message_id = result.get(
-                "id",
-                ""
-            )
-
-            sent_records[email] = {
-
+            sent_records[daily_key] = {
+                "key": daily_key,
                 "email": email,
-
                 "location": record["location"],
-
                 "timezone": record["timezone"],
-
+                "local_date": record["local_date"],
                 "type": record["type"],
-
                 "subject": subject,
-
-                "sent_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-
-                "gmail_message_id": message_id,
-
-                "attachments": [
-                    os.path.basename(x)
-                    for x in attachments
-                ]
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "gmail_message_id": mid,
+                "attachments": [os.path.basename(x) for x in attachments]
             }
 
-            save_json(
-                SENT_RECORDS_FILE,
-                sent_records
-            )
+            save_json(SENT_RECORDS_FILE, sent_records)
 
-            del scheduled_records[email]
+            del scheduled_records[daily_key]
+            save_json(SCHEDULE_FILE, scheduled_records)
 
-            save_json(
-                SCHEDULE_FILE,
-                scheduled_records
-            )
+            # Only after Gmail confirms success do we move the pending
+            # recipient into completed.
+            move_mail_to_completed(email, record)
 
             log(
-                f"EMAIL SENT | "
-                f"{email} | "
-                f"Gmail ID: {message_id}"
+                f"EMAIL SENT SUCCESS | {email} | "
+                f"Local Date: {record['local_date']} | Gmail ID: {mid}"
             )
 
         except HttpError as e:
-
             log(
-                f"GMAIL ERROR | "
-                f"{email} | {e}"
+                f"GMAIL ERROR | {email} | "
+                f"MAIL REMAINS PENDING | {e}"
             )
-
         except Exception as e:
-
             log(
-                f"SEND ERROR | "
-                f"{email} | {e}"
+                f"SEND ERROR | {email} | "
+                f"MAIL REMAINS PENDING | {e}"
             )
 
 
