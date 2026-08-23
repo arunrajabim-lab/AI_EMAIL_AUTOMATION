@@ -49,9 +49,9 @@ SCHEDULE_FILE = os.path.join(
     "scheduled_records.json"
 )
 
-# Confirmed production schedule: send at 5:00 PM in each recipient's local timezone.
-SEND_HOUR = 17
-SEND_MINUTE = 0
+# Confirmed production schedule: send at 10:20 AM in each recipient's local timezone.
+SEND_HOUR = 10
+SEND_MINUTE = 20
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -778,7 +778,7 @@ def calculate_schedule(
     now_local = datetime.now(local_zone)
 
     # Send at 5:00 PM in the recipient's local timezone.
-    # If today's 5:00 PM has not passed yet, schedule today.
+    # If today's 10:20 AM has not passed yet, schedule today.
     # Otherwise schedule the next day.
     target_local = now_local.replace(
         hour=SEND_HOUR,
@@ -1154,7 +1154,7 @@ def schedule_mail(mail, scheduled_records, sent_records):
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     save_json(SCHEDULE_FILE, scheduled_records)
-    log(f"SCHEDULED | {email} | {mail['location']} | {tz_name} | {target_date} | 5:00 PM LOCAL | PDFs: {len(attachments)}")
+    log(f"SCHEDULED | {email} | {mail['location']} | {tz_name} | {target_date} | 10:20 AM LOCAL | PDFs: {len(attachments)}")
 
 
 # ============================================================
